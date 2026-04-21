@@ -20,6 +20,38 @@ This runbook follows those pages step-for-step. Anything extra (firewall, NGINX,
 
 ---
 
+## Placeholders — replace these with your real values
+
+Every `<PLACEHOLDER>` below appears throughout this runbook. Replace them consistently (a simple `sed` over your working copy works) before you run anything.
+
+| Placeholder | Example used in this runbook | What it is / how to choose |
+|---|---|---|
+| `<NEXUS_FQDN>` | `nexus.dev.contoso.internal` | The internal DNS name users/CI hit. `<service>.<env>.<company-domain>.<private-TLD>`. Ask your network team for the exact internal domain (often `.internal`, `.corp`, `.local`, or your real company DNS zone like `tools.contoso.com`). |
+| `<NEXUS_IP>` | `10.20.30.40` | Static IP of the Nexus VM on your internal network. Assigned by your network/VMware team. |
+| `<COMPANY_DOMAIN>` | `contoso.internal` | Your internal DNS zone. Drop `nexus.dev.` to get it. |
+| `<AD_DOMAIN>` | `corp.contoso.com` | Your Active Directory DNS domain (usually different from the server hostname domain). |
+| `<AD_DC_HOST>` | `dc01.corp.contoso.com` | A domain controller hostname for LDAPS. |
+| `<SMTP_RELAY>` | `smtp.contoso.internal` | Internal SMTP relay for Nexus email notifications. |
+| `<INTERNAL_CA_CRT>` | `/etc/pki/ca-trust/source/anchors/contoso-root-ca.crt` | Path on the VM where the internal root CA certificate lives. |
+| `<DOCKER_REGISTRY>` | `nexus.dev.contoso.internal:5000` | Same FQDN as Nexus, port 5000 (from §12). |
+| `<JENKINS_URL>` | `https://jenkins.dev.contoso.internal` | Internal Jenkins URL. |
+| `<PROJECT_GROUP_ID>` | `com.contoso.myteam` | Maven `groupId` prefix your team owns. |
+| `<DOCKER_NAMESPACE>` | `myteam` | The first path segment you push images under, e.g. `<DOCKER_REGISTRY>/myteam/app:tag`. |
+
+> **Why `.internal`?** It's a conventional private DNS suffix meaning "this name only resolves inside the company network, never on the public internet." Your company may use something else — `.corp`, `.local`, `.lan`, or a real owned domain like `tools.contoso.com`. Whatever your network team uses, put it in `<NEXUS_FQDN>` and be consistent.
+
+A full realistic example, resolved:
+
+```
+<NEXUS_FQDN>           = nexus.dev.contoso.internal
+<NEXUS_IP>             = 10.20.30.40
+<DOCKER_REGISTRY>      = nexus.dev.contoso.internal:5000
+Maven group repo URL   = https://nexus.dev.contoso.internal/repository/maven-public/
+Docker image example   = nexus.dev.contoso.internal:5000/myteam/myapp:1.2.3
+```
+
+---
+
 ## 1. VM sizing (Sonatype minimums → what we actually use)
 
 Sonatype minimums for a small/medium instance: 4 vCPU, 8 GB RAM, disk proportional to artifact volume.
@@ -254,7 +286,7 @@ mkdir -p /etc/nginx/tls
 ```nginx
 server {
     listen 443 ssl http2;
-    server_name nexus.example.internal;      # replace with your FQDN
+    server_name nexus.dev.contoso.internal;   # <NEXUS_FQDN>
 
     ssl_certificate     /etc/nginx/tls/nexus.crt;
     ssl_certificate_key /etc/nginx/tls/nexus.key;
@@ -307,7 +339,7 @@ Docker clients require the registry to be at the **root** of a host, which is wh
 ```nginx
 server {
     listen 5000 ssl http2;
-    server_name nexus.example.internal;
+    server_name nexus.dev.contoso.internal;   # <NEXUS_FQDN>
 
     ssl_certificate     /etc/nginx/tls/nexus.crt;
     ssl_certificate_key /etc/nginx/tls/nexus.key;
@@ -336,54 +368,341 @@ nginx -t && systemctl reload nginx
 
 4. Test from a client:
 ```bash
-docker login nexus.example.internal:5000 -u admin
-docker pull  nexus.example.internal:5000/library/alpine:3.19     # via docker-all
-docker tag   alpine:3.19 nexus.example.internal:5000/myteam/alpine:smoke
-docker push  nexus.example.internal:5000/myteam/alpine:smoke
+# <DOCKER_REGISTRY> = nexus.dev.contoso.internal:5000
+docker login nexus.dev.contoso.internal:5000 -u admin
+docker pull  nexus.dev.contoso.internal:5000/library/alpine:3.19     # via docker-all
+docker tag   alpine:3.19 nexus.dev.contoso.internal:5000/myteam/alpine:smoke
+docker push  nexus.dev.contoso.internal:5000/myteam/alpine:smoke
 ```
 
-If you see `x509: certificate signed by unknown authority`, drop your CA into `/etc/docker/certs.d/nexus.example.internal:5000/ca.crt` and retry.
+If you see `x509: certificate signed by unknown authority`, drop your internal root CA into `/etc/docker/certs.d/nexus.dev.contoso.internal:5000/ca.crt` on the client and restart docker.
 
 ---
 
-## 13. Create baseline proxy/hosted/group repos
+## 13. Create baseline proxy / hosted / group repositories
 
 UI: **Administration → Repository → Repositories → Create repository**. Pick the recipe that matches the format:
 
 | Name | Recipe | Remote URL / notes |
 |---|---|---|
-| `maven-central` | `maven2 (proxy)` | https://repo1.maven.org/maven2/ |
-| `maven-releases` | `maven2 (hosted)` | Version policy: Release |
-| `maven-snapshots` | `maven2 (hosted)` | Version policy: Snapshot |
-| `maven-public` | `maven2 (group)` | Members: central, releases, snapshots |
-| `npm-proxy` | `npm (proxy)` | https://registry.npmjs.org |
+| `maven-central` | `maven2 (proxy)` | `https://repo1.maven.org/maven2/` |
+| `maven-releases` | `maven2 (hosted)` | Version policy: **Release**, deployment policy: **Disable redeploy** |
+| `maven-snapshots` | `maven2 (hosted)` | Version policy: **Snapshot**, deployment policy: **Allow redeploy** |
+| `maven-public` | `maven2 (group)` | Members (order matters): `maven-releases`, `maven-snapshots`, `maven-central` |
+| `npm-proxy` | `npm (proxy)` | `https://registry.npmjs.org` |
 | `npm-hosted` | `npm (hosted)` | |
-| `npm-all` | `npm (group)` | Members: proxy, hosted |
-| `pypi-proxy` | `pypi (proxy)` | https://pypi.org |
+| `npm-all` | `npm (group)` | Members: `npm-hosted`, `npm-proxy` |
+| `pypi-proxy` | `pypi (proxy)` | `https://pypi.org` |
 
-Client config:
+**Client rule:** builds only ever talk to the **group** URL (`maven-public`, `npm-all`). Never point a build at a single proxy or hosted repo — the group resolves them in order.
 
-`~/.m2/settings.xml` (on build machines):
+---
+
+## 14. Integration Steps (with placeholders)
+
+Each integration below follows the same shape: **(a) what to create in Nexus**, **(b) what to paste on the consumer**, **(c) how to verify**. Replace every `<PLACEHOLDER>` from the table at the top of this runbook.
+
+### 14.1 Maven / Gradle builds on developer machines and Jenkins agents
+
+**(a) In Nexus**
+- Repos from §13 are enough. No extra config needed.
+- Create a deployment user (UI → **Security → Users → Create**): `svc-ci-deploy`, roles = `nx-repository-view-maven2-*-*` + `nx-apikey-all` (so it can push via the REST API). Store password in your secret store.
+
+**(b) On each Maven client**
+
+`~/.m2/settings.xml`:
 ```xml
 <settings>
+  <servers>
+    <server>
+      <id>nexus-releases</id>
+      <username>svc-ci-deploy</username>
+      <password>${env.NEXUS_DEPLOY_PASSWORD}</password>
+    </server>
+    <server>
+      <id>nexus-snapshots</id>
+      <username>svc-ci-deploy</username>
+      <password>${env.NEXUS_DEPLOY_PASSWORD}</password>
+    </server>
+  </servers>
   <mirrors>
     <mirror>
       <id>nexus</id>
       <mirrorOf>*</mirrorOf>
-      <url>https://nexus.example.internal/repository/maven-public/</url>
+      <!-- All dependency resolution goes through the group -->
+      <url>https://nexus.dev.contoso.internal/repository/maven-public/</url>
     </mirror>
   </mirrors>
 </settings>
 ```
 
-`~/.npmrc`:
+In each project's `pom.xml` (for `mvn deploy`):
+```xml
+<distributionManagement>
+  <repository>
+    <id>nexus-releases</id>
+    <url>https://nexus.dev.contoso.internal/repository/maven-releases/</url>
+  </repository>
+  <snapshotRepository>
+    <id>nexus-snapshots</id>
+    <url>https://nexus.dev.contoso.internal/repository/maven-snapshots/</url>
+  </snapshotRepository>
+</distributionManagement>
 ```
-registry=https://nexus.example.internal/repository/npm-all/
+
+**(c) Verify**
+```bash
+# Resolution (no auth needed for group reads once anonymous is allowed, else use -s with creds)
+mvn -s ~/.m2/settings.xml dependency:get \
+  -Dartifact=org.apache.commons:commons-lang3:3.14.0
+
+# Deploy a snapshot
+mvn -s ~/.m2/settings.xml deploy
+# Expect: "Uploaded to nexus-snapshots: https://nexus.dev.contoso.internal/.../.../<artifact>.jar"
 ```
 
 ---
 
-## 14. Backup
+### 14.2 npm clients (devs + CI)
+
+**(a) In Nexus**
+- `npm-all` group from §13 is the single URL consumers use.
+
+**(b) On each client**
+
+`~/.npmrc`:
+```
+registry=https://nexus.dev.contoso.internal/repository/npm-all/
+# If your group requires auth (recommended), add the line below after running
+#   npm login --registry=https://nexus.dev.contoso.internal/repository/npm-all/
+# //nexus.dev.contoso.internal/repository/npm-all/:_authToken=NpmToken.xxxxxxxx
+```
+
+**(c) Verify**
+```bash
+npm view express version --registry=https://nexus.dev.contoso.internal/repository/npm-all/
+# Expect: a version string like 4.19.2
+```
+
+---
+
+### 14.3 Python / pip clients
+
+**(a) In Nexus**
+- `pypi-proxy` from §13.
+
+**(b) On each client**
+
+`~/.pip/pip.conf` (Linux/macOS) or `%APPDATA%\pip\pip.ini` (Windows):
+```ini
+[global]
+index-url = https://nexus.dev.contoso.internal/repository/pypi-proxy/simple/
+trusted-host = nexus.dev.contoso.internal
+```
+
+**(c) Verify**
+```bash
+pip install --dry-run requests
+# Expect: "Looking in indexes: https://nexus.dev.contoso.internal/repository/pypi-proxy/simple/"
+```
+
+---
+
+### 14.4 Docker clients (devs + Jenkins agents + Kubernetes nodes)
+
+Requires the Docker registry from §12 to be live.
+
+**(a) In Nexus**
+- `docker-hosted`, `docker-proxy`, `docker-all` from §12.
+- Active realms include **Docker Bearer Token Realm**.
+
+**(b) On each client (one-time host trust setup)**
+
+```bash
+# Trust the internal CA at the OS level
+sudo cp <INTERNAL_CA_CRT> /etc/pki/ca-trust/source/anchors/
+sudo update-ca-trust
+
+# Docker-specific trust (required if registry uses internal CA)
+sudo mkdir -p /etc/docker/certs.d/nexus.dev.contoso.internal:5000
+sudo cp <INTERNAL_CA_CRT> /etc/docker/certs.d/nexus.dev.contoso.internal:5000/ca.crt
+sudo systemctl restart docker
+```
+
+**(c) Use it**
+```bash
+# Login (uses the Nexus user's creds)
+docker login nexus.dev.contoso.internal:5000 -u svc-ci-deploy
+
+# Pull from Docker Hub through the proxy
+docker pull nexus.dev.contoso.internal:5000/library/alpine:3.19
+
+# Push a team image
+docker tag  myapp:1.2.3  nexus.dev.contoso.internal:5000/myteam/myapp:1.2.3
+docker push nexus.dev.contoso.internal:5000/myteam/myapp:1.2.3
+```
+
+**(d) In Kubernetes (pulling private images)**
+
+```bash
+kubectl -n <my-namespace> create secret docker-registry nexus-pull \
+  --docker-server=nexus.dev.contoso.internal:5000 \
+  --docker-username=svc-ci-deploy \
+  --docker-password='<password>' \
+  --docker-email=devops@contoso.com
+```
+
+```yaml
+# in your Deployment / Pod spec
+spec:
+  imagePullSecrets:
+    - name: nexus-pull
+  containers:
+    - name: app
+      image: nexus.dev.contoso.internal:5000/myteam/myapp:1.2.3
+```
+
+---
+
+### 14.5 Jenkins (declarative pipeline example)
+
+**(a) In Nexus** — create `svc-jenkins-deploy` user with roles:
+- `nx-repository-view-maven2-*-*` (for maven push)
+- `nx-repository-view-docker-*-*` (for docker push)
+- `nx-apikey-all`
+
+**(b) In Jenkins** — add two credentials:
+- `nexus-deploy` → Username/password for `svc-jenkins-deploy`.
+- `nexus-maven-settings` → **Config File Provider** plugin, Maven settings file content = the `settings.xml` from §14.1 (with `${env.NEXUS_DEPLOY_PASSWORD}` resolving from `withCredentials`).
+
+**(c) Pipeline**
+
+```groovy
+pipeline {
+  agent any
+  environment {
+    REGISTRY   = 'nexus.dev.contoso.internal:5000'   // <DOCKER_REGISTRY>
+    IMAGE      = "${REGISTRY}/myteam/myapp"          // <DOCKER_NAMESPACE>
+    MVN_GROUP  = 'com.contoso.myteam'                // <PROJECT_GROUP_ID>
+  }
+  stages {
+    stage('Build & deploy JAR to Nexus') {
+      steps {
+        configFileProvider([configFile(fileId: 'nexus-maven-settings', variable: 'MVN_SETTINGS')]) {
+          withCredentials([usernamePassword(
+              credentialsId: 'nexus-deploy',
+              usernameVariable: 'NEXUS_USER',
+              passwordVariable: 'NEXUS_DEPLOY_PASSWORD')]) {
+            sh 'mvn -s "$MVN_SETTINGS" -B clean deploy'
+          }
+        }
+      }
+    }
+    stage('Build & push Docker image') {
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: 'nexus-deploy',
+            usernameVariable: 'NEXUS_USER',
+            passwordVariable: 'NEXUS_PASS')]) {
+          sh '''
+            echo "$NEXUS_PASS" | docker login "$REGISTRY" -u "$NEXUS_USER" --password-stdin
+            docker build -t "$IMAGE:${BUILD_NUMBER}" .
+            docker push "$IMAGE:${BUILD_NUMBER}"
+          '''
+        }
+      }
+    }
+  }
+}
+```
+
+**(d) Verify** — the job should produce a `com.contoso.myteam:myapp:<version>` artifact in `maven-releases` (or `-snapshots`) and a new tag in `docker-hosted`.
+
+---
+
+### 14.6 Active Directory / LDAPS single sign-on
+
+**(a) In Nexus** — UI: **Security → LDAP → Create connection**.
+
+| Field | Value |
+|---|---|
+| Name | `contoso-ad` |
+| Protocol | `ldaps` |
+| Host | `dc01.corp.contoso.com`  (`<AD_DC_HOST>`) |
+| Port | `636` |
+| Search base | `DC=corp,DC=contoso,DC=com`  (derived from `<AD_DOMAIN>`) |
+| Authentication method | Simple |
+| Username | `CN=svc-nexus-ldap,OU=ServiceAccounts,DC=corp,DC=contoso,DC=com` |
+| Password | from your vault |
+| User subtree | checked |
+| User object class | `user` |
+| User ID attribute | `sAMAccountName` |
+| Real name attribute | `displayName` |
+| Email attribute | `mail` |
+| Group mapping | **Dynamic groups**, member-of attribute `memberOf` |
+
+Prerequisite: the AD root CA must be in the VM's Java trust store:
+```bash
+keytool -importcert -noprompt -trustcacerts \
+  -alias contoso-root-ca \
+  -file <INTERNAL_CA_CRT> \
+  -keystore /opt/sonatype/nexus-3.x.y-z/jre/lib/security/cacerts \
+  -storepass changeit
+systemctl restart nexus
+```
+
+**(b) Map AD groups to Nexus roles** — UI: **Security → Roles → Create role**, role type **External**, source `LDAP`. Example mapping:
+
+| AD group (mapped ID) | Nexus role | Built-in roles included |
+|---|---|---|
+| `grp-nexus-admins` | `nexus-admins-role` | `nx-admin` |
+| `grp-nexus-developers` | `nexus-devs-role` | `nx-repository-view-*-*-*` (read+edit on non-release), `nx-apikey-all` |
+| `grp-nexus-readers` | `nexus-readers-role` | `nx-repository-view-*-*-read` |
+
+**(c) Verify**
+```bash
+# On the Nexus VM, test LDAPS reachability before using it in the UI:
+dnf install -y openldap-clients
+ldapsearch -H ldaps://dc01.corp.contoso.com:636 \
+  -D "CN=svc-nexus-ldap,OU=ServiceAccounts,DC=corp,DC=contoso,DC=com" \
+  -W -b "DC=corp,DC=contoso,DC=com" "(sAMAccountName=yourtestuser)"
+```
+Then log in to the Nexus UI as an AD user — the first login auto-creates the mapping.
+
+---
+
+### 14.7 Email notifications (optional)
+
+UI → **System → Email Server**:
+
+| Field | Value |
+|---|---|
+| Host | `smtp.contoso.internal`  (`<SMTP_RELAY>`) |
+| Port | `25` (or `587` with STARTTLS) |
+| From address | `nexus-noreply@contoso.com` |
+| Subject prefix | `[NEXUS-DEV]` |
+
+Click **Verify email server** with a real recipient.
+
+---
+
+### 14.8 Internal DNS — planning and cutover
+
+Before any of the above is addressable by FQDN you need a DNS record. Coordinate with your network team:
+
+1. **Forward record (A):** `nexus.dev.contoso.internal` → `<NEXUS_IP>` in the internal DNS zone.
+2. **Reverse record (PTR):** recommended for logs to resolve cleanly.
+3. **TTL:** set to **60 s** during cutover week so rollback is fast; raise to 1 h after.
+
+**Temporary workaround** before DNS exists — add a line to `/etc/hosts` on the Nexus VM and on any admin workstation:
+```
+10.20.30.40  nexus.dev.contoso.internal
+```
+This lets you bring up TLS (§11) and test everything end-to-end before the DNS record goes live.
+
+---
+
+## 15. Backup
 
 Official: https://help.sonatype.com/repomanager3/installation/backing-up-repository-manager
 
@@ -399,7 +718,7 @@ Official: https://help.sonatype.com/repomanager3/installation/backing-up-reposit
 
 ---
 
-## 15. Upgrade procedure (official)
+## 16. Upgrade procedure (official)
 
 Official: https://help.sonatype.com/repomanager3/installation/upgrading
 
@@ -407,7 +726,7 @@ Official: https://help.sonatype.com/repomanager3/installation/upgrading
 # 1. Stop
 systemctl stop nexus
 
-# 2. Back up (as in §14)
+# 2. Back up (as in §15)
 
 # 3. Extract new tarball alongside the old one
 cd /opt/sonatype
@@ -434,7 +753,7 @@ Rollback: stop service, put `ExecStart`/`ExecStop` back to the old path, start. 
 
 ---
 
-## 16. Validation (run in order)
+## 17. Validation (run in order)
 
 ```bash
 # 1. Service up
@@ -453,21 +772,21 @@ curl -s http://localhost:8081/service/rest/v1/status               # empty body,
 grep "Started Sonatype Nexus" /nexus-data/sonatype-work/nexus3/log/nexus.log
 
 # 6. (after §11) HTTPS
-curl -sk -o /dev/null -w "%{http_code}\n" https://nexus.example.internal/   # 200
+curl -sk -o /dev/null -w "%{http_code}\n" https://nexus.dev.contoso.internal/   # 200
 
 # 7. (after §13) Maven proxy pulls through
 curl -sk -o /dev/null -w "%{http_code}\n" \
-  https://nexus.example.internal/repository/maven-public/org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.pom
+  https://nexus.dev.contoso.internal/repository/maven-public/org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.pom
 # 200 (first hit may take a few seconds)
 
 # 8. (after §12) Docker
-docker login nexus.example.internal:5000 -u admin
-docker pull  nexus.example.internal:5000/library/alpine:3.19
+docker login nexus.dev.contoso.internal:5000 -u admin
+docker pull  nexus.dev.contoso.internal:5000/library/alpine:3.19
 ```
 
 ---
 
-## 17. Common real failures and fixes
+## 18. Common real failures and fixes
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -482,7 +801,7 @@ docker pull  nexus.example.internal:5000/library/alpine:3.19
 
 ---
 
-## 18. Day-2 cheat sheet
+## 19. Day-2 cheat sheet
 
 | Task | Command / Location |
 |---|---|
@@ -504,5 +823,6 @@ docker pull  nexus.example.internal:5000/library/alpine:3.19
 - [ ] §10 first-login done, admin password rotated
 - [ ] §11 TLS working on FQDN (if applicable)
 - [ ] §12 Docker registry login/pull/push works (if applicable)
-- [ ] §14 backup task scheduled and first backup verified
-- [ ] §16 all validations pass
+- [ ] §14 integrations for each consumer (Maven/npm/pip/Docker/Jenkins/AD) validated
+- [ ] §15 backup task scheduled and first backup verified
+- [ ] §17 all validations pass
