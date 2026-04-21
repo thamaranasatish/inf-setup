@@ -250,18 +250,41 @@ Exactly as documented: https://help.sonatype.com/repomanager3/installation/run-a
 
 ---
 
-## 7. Configure listen address and data directory (optional but recommended)
+## 7. Configure listen address (override file)
 
-File: `/opt/sonatype/sonatype-work/nexus3/etc/nexus.properties`
-(Create it if it doesn't exist. Defaults live in the binary's `etc/nexus-default.properties` — do not edit that file.)
+> **IMPORTANT — never edit `nexus-default.properties`.**
+> The file `/opt/sonatype/nexus-<version>/etc/nexus-default.properties` ships with the binary and is the **vendor default**. Its first line says: `## DO NOT EDIT - CUSTOMIZATIONS BELONG IN $data-dir/etc/nexus.properties`. Reasons you must respect this:
+>
+> 1. **Upgrades overwrite it.** Every new Nexus tarball replaces this file. Any edits are silently lost the next time you upgrade (§16).
+> 2. **Override, don't replace.** Nexus reads `nexus-default.properties` first, then `nexus.properties` on top. Your file should contain **only the lines you want to change** — everything else inherits from the vendor default.
+> 3. **Clean audit trail.** A 3-line `nexus.properties` makes it obvious what this instance does differently from a stock install. A modified default file hides that.
+> 4. **Vendor support.** Sonatype support will ask for `nexus.properties`. They expect only your overrides there. A modified default file is a red flag.
+>
+> **Rule of thumb:** anything under `/opt/sonatype/nexus-<version>/` is vendor-owned and gets wiped on upgrade. Anything under `/nexus-data/sonatype-work/nexus3/` is yours and survives upgrades.
 
-```properties
+### Where the override file lives
+
+`/nexus-data/sonatype-work/nexus3/etc/nexus.properties` (i.e. `$data-dir/etc/nexus.properties`).
+
+Create it only if you need to change something. For a first test install where the defaults (`0.0.0.0:8081`, context `/`) are fine, **you can skip this step entirely**.
+
+If you *do* need it (e.g. later to bind to 127.0.0.1 for NGINX in §11):
+
+```bash
+# Create the override file with only the lines that differ from defaults
+install -o nexus -g nexus -m 640 /dev/null /nexus-data/sonatype-work/nexus3/etc/nexus.properties
+
+cat > /nexus-data/sonatype-work/nexus3/etc/nexus.properties <<'EOF'
 application-port=8081
 application-host=0.0.0.0
 nexus-context-path=/
+EOF
+
+chown nexus:nexus /nexus-data/sonatype-work/nexus3/etc/nexus.properties
+chmod 640         /nexus-data/sonatype-work/nexus3/etc/nexus.properties
 ```
 
-Leave `application-host=0.0.0.0` for now so you can reach the UI directly. If you add NGINX (§11), change it to `127.0.0.1`.
+Leave `application-host=0.0.0.0` while you're bringing the instance up so you can reach the UI directly. When you add NGINX (§11), change the line to `application-host=127.0.0.1` and restart Nexus.
 
 ---
 
