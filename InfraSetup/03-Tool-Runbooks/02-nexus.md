@@ -114,26 +114,80 @@ id nexus
 
 ---
 
-## 4. Mount the data disk
+## 4. Create and mount `/nexus-data`
 
-Assuming vSphere added a second VMDK that shows up as `/dev/sdb`:
+### Why a dedicated disk on-prem
+
+`/nexus-data` is where Nexus stores **everything stateful** — the embedded database, configuration, logs, and blob stores (the actual JARs/images/packages). Over time this grows from MBs to hundreds of GBs or TBs. Keeping it on its own disk/LUN gives you:
+
+| Benefit | What it buys you |
+|---|---|
+| **Growth without touching the OS disk** | Add a new VMDK or expand the existing one in vSphere, run `xfs_growfs /nexus-data` — the root filesystem never moves. |
+| **Independent backup/snapshot** | vSphere snapshots, storage-array snapshots, or Veeam jobs can target just `/nexus-data`. |
+| **Blast radius control** | A full blob store (`/nexus-data` at 100%) doesn't take down the OS — you just lose Nexus, not SSH/systemd/logging. |
+| **Better I/O** | The storage team can place this LUN on faster/tiered storage (SSD tier, thin-provisioned, dedup'd) independently from the OS disk. |
+| **Ownership hygiene** | The whole mount is owned by `nexus:nexus`; root stays owned by `root:root`. No mixed ownership inside `/`. |
+
+### 4a. On-prem (VMware vSphere) — with a dedicated disk
+
+Prerequisite: ask the VMware team to add a **second VMDK** to the VM (200 GB+ to start, thin-provisioned, on the appropriate datastore). It appears to Linux as `/dev/sdb` (SCSI). Always confirm with `lsblk` first — never hard-code the device name.
 
 ```bash
+# 1. Find the new disk. Look for a disk with no partitions / no MOUNTPOINT.
 lsblk
-# sdb   8:16   0   200G  0 disk
+# NAME   SIZE MOUNTPOINTS
+# sda     60G             ← OS disk, has partitions
+# sdb    200G             ← NEW disk, empty. Use this.
 
-# Create filesystem (XFS = RHEL default)
+# 2. Make a filesystem (XFS is the RHEL 9 default and recommended for large FS)
 mkfs.xfs /dev/sdb
+
+# 3. Create the mountpoint directory
 mkdir -p /nexus-data
 
-# Persistent mount
+# 4. Add a persistent mount entry (by UUID so it survives device renames)
 UUID=$(blkid -s UUID -o value /dev/sdb)
-echo "UUID=${UUID}  /nexus-data  xfs  defaults,noatime  0 0" >> /etc/fstab
-mount -a
-mountpoint /nexus-data     # /nexus-data is a mountpoint
+echo "UUID=${UUID}  /nexus-data  xfs  defaults,noatime  0 2" >> /etc/fstab
 
+# 5. Mount it now (also validates fstab syntax — if this fails, reboot will fail too)
+mount -a
+mountpoint /nexus-data
+# Expected: /nexus-data is a mountpoint
+
+# 6. Set ownership so the nexus user can write everywhere under it
 chown nexus:nexus /nexus-data
+chmod 750 /nexus-data
 ```
+
+**What those fstab options do:**
+
+| Option | Why |
+|---|---|
+| `defaults` | Standard options (rw, suid, dev, exec, auto, nouser, async). |
+| `noatime` | Don't update file access timestamps — large speedup on blob stores with many small files. |
+| `0` (dump) | Dump backup not used. |
+| `2` (fsck pass) | Checked after root (pass 1). Set `0` if you use journaling with no auto-fsck. |
+
+**Permissions rationale:**
+- Owner `nexus:nexus` — the `nexus` service user must read/write freely.
+- Mode `750` — owner full, group read+traverse, **world no access**. Artifact bytes and the embedded DB shouldn't be world-readable.
+- The Nexus process (running as `nexus` per §6) creates subdirs under this mount with its own umask; they will all be `nexus:nexus` automatically.
+
+### 4b. AWS / any cloud without a second disk (testing)
+
+If you're just proving the install works and haven't attached a second EBS volume, use a plain directory on the root filesystem:
+
+```bash
+mkdir -p /nexus-data
+chown nexus:nexus /nexus-data
+chmod 750 /nexus-data
+```
+
+Skip the `mkfs.xfs`, `blkid`, `fstab`, and `mount -a` steps — there's no separate block device to format.
+
+**Make sure the root disk is large enough** (at least 40 GB for a test instance; more if you'll push real Docker images). Everything else in this runbook works unchanged.
+
+> When you later move this install to on-prem (or production AWS), come back to §4a and do it properly: attach a dedicated volume, move the contents of `/nexus-data` onto it, and remount. The rest of the install doesn't need to change.
 
 ---
 
