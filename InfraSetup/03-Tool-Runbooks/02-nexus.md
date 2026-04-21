@@ -200,16 +200,31 @@ cd /opt
 mkdir -p sonatype
 cd sonatype
 
-# The "latest" redirect always points at the current stable OSS tarball.
-# You can also pin to a specific version URL shown on the download page.
-curl -L -O https://download.sonatype.com/nexus/3/nexus-unix-x86-64.tar.gz
+# 1. Get the CURRENT version string from the official download page first:
+#    https://help.sonatype.com/repomanager3/product-information/download
+#    Look for "Unix Archive (tar.gz)". The filename follows the pattern:
+#      nexus-<major>.<minor>.<patch>-<build>-unix.tar.gz
+#    Example used below — REPLACE with whatever the page shows today.
+NEXUS_VERSION="3.71.0-06"
 
-tar -xzf nexus-unix-x86-64.tar.gz
+# 2. Download. -f = fail on HTTP error (so you don't silently save a 404 HTML page)
+#              -L = follow redirects
+#              -O = save with remote filename
+curl -fL -O "https://download.sonatype.com/nexus/3/nexus-${NEXUS_VERSION}-unix.tar.gz"
+
+# 3. Verify the file is a real gzipped tarball, not an error page
+file   "nexus-${NEXUS_VERSION}-unix.tar.gz"    # → gzip compressed data, ...
+ls -lh "nexus-${NEXUS_VERSION}-unix.tar.gz"    # → ~170–200 MB
+
+# 4. Extract
+tar -xzf "nexus-${NEXUS_VERSION}-unix.tar.gz"
 ls
-# nexus-3.x.y-z/      sonatype-work/
+# nexus-3.71.0-06/      sonatype-work/
 ```
 
-This matches the official procedure: extract into `/opt/sonatype` producing two sibling directories — `nexus-3.x.y-z` (binaries) and `sonatype-work` (data).
+> **If `tar` says "not in gzip format":** you didn't get a real tarball. `file` will show `HTML document` or `ASCII text` — that's a 404 or login page saved as `.tar.gz`. Re-check the URL from the download page and re-run with `curl -fL` so the failure is visible next time.
+
+This matches the official procedure: extract into `/opt/sonatype` producing two sibling directories — `nexus-<version>` (binaries) and `sonatype-work` (data).
 
 Move `sonatype-work` onto the dedicated disk and link it back:
 
@@ -784,8 +799,8 @@ systemctl stop nexus
 
 # 3. Extract new tarball alongside the old one
 cd /opt/sonatype
-curl -L -O https://download.sonatype.com/nexus/3/nexus-unix-x86-64.tar.gz
-tar -xzf nexus-unix-x86-64.tar.gz
+curl -fL -O "https://download.sonatype.com/nexus/3/nexus-<new-version>-unix.tar.gz"
+tar -xzf "nexus-<new-version>-unix.tar.gz"
 chown -R nexus:nexus nexus-3.<new-version>
 
 # 4. Re-apply run_as_user in the NEW bin/nexus.rc
