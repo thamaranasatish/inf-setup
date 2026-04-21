@@ -54,20 +54,101 @@ Docker image example   = nexus.dev.contoso.internal:5000/myteam/myapp:1.2.3
 
 ## 1. VM sizing (Sonatype minimums → what we actually use)
 
-Sonatype minimums for a small/medium instance: 4 vCPU, 8 GB RAM, disk proportional to artifact volume.
+### 1.1 Official Sonatype guidance
 
-For a DEV instance serving ~30 users:
+Source: https://help.sonatype.com/repomanager3/product-information/sonatype-nexus-repository-system-requirements
+
+| Size | Sonatype minimum | Target load |
+|---|---|---|
+| Small | **4 vCPU, 8 GB RAM** | < 20 concurrent users, a few formats, < 200 GB blobs |
+| Medium | 8 vCPU, 16 GB RAM | 20–100 users, many formats, 200 GB – 2 TB blobs |
+| Large | 16 vCPU, 32 GB+ RAM | > 100 users, HA/cluster, > 2 TB blobs |
+
+The JVM default heap is ~2.7 GB. Nexus also uses direct memory (default 2 GB) for blob I/O. Add OS overhead and you **cannot realistically run Nexus 3.71+ below 4 GB RAM** — that's what the OOM-kill in §21.2 proved.
+
+### 1.2 What we validated on AWS (reference baseline)
+
+The install was proven end-to-end on a **single-user smoke test** with:
+
+| Attribute | Value |
+|---|---|
+| Instance type | `c7i-flex.large` |
+| vCPU | 2 |
+| RAM | 4 GB |
+| Network | up to 12.5 Gbps |
+| Heap tuning | `-Xms1G -Xmx1G -XX:MaxDirectMemorySize=1G` (§8.1) |
+
+Outcome: the UI is responsive for 1 admin, repositories can be created, and maven/npm/pypi proxies work. This is **sub-minimum** vs Sonatype's own spec and is acceptable **only for the install-validation phase**. Day-2 symptoms on this size:
+
+- Heap pressure / GC pauses as soon as 2–3 users hit the UI at once.
+- OOM-kill risk if a single large Docker push lands while other traffic is active.
+- No headroom for `Admin - Compact blob store` (§20.6) — it runs I/O-heavy and wants direct memory.
+
+Plan to resize up the moment real users/CI land on it. On AWS that's a 2-minute stop → change instance type → start (see §21.2).
+
+### 1.3 On-prem right-sizing (RHEL 9 VM on VMware)
+
+Use the Sonatype minimum as the floor and size by **concurrency + blob footprint**, not by "it's just dev".
+
+| Tier | When | vCPU | RAM | Heap (`-Xmx`) | Direct (`MaxDirectMemorySize`) | Network |
+|---|---|---|---|---|---|---|
+| **Install validation only** | Proving install works, 1 admin, no CI | 2 | 4 GB | 1 G | 1 G | 1 Gbps |
+| **Small (recommended DEV floor)** | ≤ 20 devs + 1–2 CI agents, Maven + npm + pip | 4 | 8 GB | 2.7 G (default) | 2 G (default) | 1 Gbps |
+| **Medium (default PROD)** | 20–100 devs, multiple CI agents, Docker hosted+proxy, nightly jobs | 8 | 16 GB | 6 G | 4 G | 10 Gbps |
+| **Large** | > 100 devs, heavy Docker/Helm, HA plans, > 2 TB blobs | 16 | 32 GB | 16 G | 8 G | 10 Gbps |
+
+**Rules of thumb for the JVM once you're above 8 GB RAM:**
+- `-Xms` = `-Xmx` (avoid heap resizing at runtime).
+- Leave roughly **50% of physical RAM** for `-Xmx` + `MaxDirectMemorySize` combined; the rest is for OS page cache (which is what makes blob reads fast) and the JVM's non-heap.
+- Example for 16 GB VM: `-Xmx6G -XX:MaxDirectMemorySize=4G` → 10 GB for JVM, 6 GB for page cache.
+- Do **not** oversubscribe vCPU on the ESXi host for a production Nexus — Nexus is latency-sensitive under load.
+
+### 1.4 Storage sizing
+
+Sonatype stores DB, config, logs, and **blob stores** (the actual JARs/images/packages) under one `sonatype-work/nexus3` directory. Size `/nexus-data` by forecasted footprint, not by "today's" size — blobs grow monotonically unless cleanup policies run (§20.6).
+
+| Mount | Size | Why |
+|---|---|---|
+| `/` | 40 GB | OS + logs. Never grows unboundedly if `/var/log` is trimmed by default logrotate. |
+| `/opt` | 20 GB | Nexus binary tarballs (each release ~200 MB; keep 1 current + 1 previous for rollback). |
+| `/nexus-data` | **dedicated VMDK** | Embedded DB + **blob stores**. See estimate below. |
+| swap | 0 (or 2 GB) | Optional. Not a substitute for RAM — if you're swapping, fix RAM instead. |
+
+**Blob footprint estimate (`/nexus-data` sizing):**
+
+| Workload | 6-month estimate | 24-month estimate |
+|---|---|---|
+| Small dev team (Maven + npm + pip only, no Docker) | 50 GB | 150 GB |
+| + Docker hosted for internal apps | 200 GB | 500 GB – 1 TB |
+| + Docker proxy for Docker Hub + multiple teams | 500 GB – 1 TB | 2 TB+ |
+| Enterprise multi-format (Maven/npm/pip/Docker/Helm/apt/yum) | 1 TB | 3–5 TB |
+
+Start with a thin-provisioned 200 GB VMDK for a DEV instance and 500 GB for a first PROD. Enable cleanup policies **before** the first 100 GB of blobs — retroactive cleanup on a 1 TB blob store is painful.
+
+**Why a dedicated `/nexus-data` disk:** growth without touching the OS disk, independent snapshot/backup scope, storage-tier placement (SSD for DB, cheaper tier for cold blobs later), and a full disk takes down only Nexus — not SSH/systemd/logging. See §4a for the mount procedure.
+
+### 1.5 Network
+
+- **Bandwidth:** a single Docker image layer push is a multi-GB transfer at CI speed; an npm-install storm from a CI fleet can saturate 1 Gbps. For production on-prem, give the VM a **10 Gbps** vNIC and make sure the uplink from the ESXi host and the storage network match.
+- **Latency:** builds feel slow if Nexus-to-client RTT exceeds ~5 ms. Put Nexus in the same site/rack as the bulk of the CI agents.
+- **Firewall:** only these ports need external access — `443` (UI + API via NGINX, §11), `5000` (Docker registry via NGINX, §12). Keep `8081`/`8082`/`8083` on localhost once NGINX is live.
+
+### 1.6 Final on-prem recommendation (one concrete spec to copy)
+
+For a typical internal DEV instance serving ~30 users with Maven + npm + pip + Docker:
 
 | Resource | Value |
 |---|---|
-| vCPU | 4 |
-| RAM | 8 GB |
-| `/` | 40 GB |
-| `/opt` | 20 GB (binaries) |
-| `/nexus-data` | dedicated disk, start 200 GB, expandable (holds DB + blobs) |
-| OS | RHEL 9 (9.2+) |
+| vCPU | **4** |
+| RAM | **8 GB** |
+| `/` | 40 GB (thin) |
+| `/opt` | 20 GB (thin) |
+| `/nexus-data` | **200 GB dedicated VMDK, thin-provisioned, expandable** |
+| vNIC | 1 Gbps (10 Gbps for PROD) |
+| OS | RHEL 9.2+ |
+| JVM | stock `nexus.vmoptions` (do not tune down) |
 
-**Why a dedicated `/nexus-data` disk:** Sonatype stores DB, config, logs, and blob stores under one `sonatype-work/nexus3` directory. Keeping it on its own VMDK lets you grow it without touching the OS disk.
+For PROD at the same scale, **double RAM to 16 GB, vCPU to 8**, make the data disk 500 GB, and put it on the 10 Gbps network.
 
 ---
 
@@ -1015,6 +1096,411 @@ docker pull  nexus.dev.contoso.internal:5000/library/alpine:3.19
 | Reset admin password (locked out) | Follow Sonatype KB: https://support.sonatype.com/hc/en-us/articles/213467158 |
 | Health endpoint | `GET /service/rest/v1/status` |
 | Repo admin via API | `POST /service/rest/v1/repositories/<format>/<type>` (REST API reference in Sonatype docs) |
+
+---
+
+## 20. Nexus management after first login (repository setup for real use)
+
+A fresh Nexus 3 install only ships with the two default format sets (`maven-*` and `nuget*`) visible under **Browse**. npm, Docker, PyPI, Helm, apt, yum, raw, etc. are **not** pre-created — you build them yourself. This section is the minimum admin walk-through to get each format usable.
+
+Open the UI → ⚙️ (gear) → **Repository → Repositories → Create repository**. For every format you create **three** repos in this order:
+
+| Type | Purpose | Clients use it? |
+|---|---|---|
+| `<fmt> (proxy)` | Caches an upstream public registry (npmjs.org, Docker Hub, PyPI, etc.). | No — hidden behind the group. |
+| `<fmt> (hosted)` | Stores your own private uploads / internal releases. | No — hidden behind the group. |
+| `<fmt> (group)` | Single URL that merges hosted + proxy and resolves in order. | **Yes — this is the URL every build/client points at.** |
+
+> **Golden rule:** clients always hit the **group** URL (`/repository/<fmt>-group/`). Never point builds at a raw proxy or hosted repo — you lose the ability to add mirrors, move upstreams, or layer private packages later.
+
+Throughout this section, substitute your `<NEXUS_URL>`:
+- **On-prem with TLS (from §11):** `https://nexus.dev.contoso.internal` (i.e. `https://<NEXUS_FQDN>`)
+- **AWS / no-TLS test install:** `http://<ec2-public-ip-or-dns>:8081`
+
+### 20.1 npm (registry.npmjs.org)
+
+**Create in UI:**
+
+| Repo | Recipe | Key settings |
+|---|---|---|
+| `npm-proxy` | `npm (proxy)` | Remote storage: `https://registry.npmjs.org` · Blob store: `default` |
+| `npm-hosted` | `npm (hosted)` | Deployment policy: `Allow redeploy` (dev) or `Disable redeploy` (release line) |
+| `npm-group` | `npm (group)` | Members (order): `npm-hosted`, `npm-proxy` |
+
+**Enable the npm auth realm:** UI → **Security → Realms** → move **npm Bearer Token Realm** to the active list → Save. Without this, `npm login` fails with `E401`.
+
+**Client use (`.npmrc` in project root or `~/.npmrc`):**
+```
+registry=<NEXUS_URL>/repository/npm-group/
+always-auth=true
+```
+
+```bash
+# One-time login (stores token in .npmrc)
+npm login --registry=<NEXUS_URL>/repository/npm-group/
+
+# Install — first request is fetched from npmjs.org and cached
+npm install express
+
+# Publish a private package (goes to npm-hosted through the group)
+npm publish --registry=<NEXUS_URL>/repository/npm-hosted/
+```
+
+### 20.2 Docker
+
+Docker is the one format where **port matters**: the Docker client demands the registry at the root of a host, and each Nexus docker repo needs its own "HTTP connector port".
+
+**Create in UI:**
+
+| Repo | Recipe | HTTP connector port | Other |
+|---|---|---|---|
+| `docker-proxy` | `docker (proxy)` | leave blank | Remote: `https://registry-1.docker.io` · Docker index: **Use Docker Hub** |
+| `docker-hosted` | `docker (hosted)` | `8082` | Deployment policy as needed |
+| `docker-group` | `docker (group)` | `8083` | Members: `docker-hosted`, `docker-proxy` |
+
+**Enable:** UI → **Security → Realms** → add **Docker Bearer Token Realm**.
+
+**On-prem (production path — §12):** do not expose 8082/8083 directly; put NGINX on 5000 in front of the group connector (see §12 for the full `nexus-docker.conf`). Clients then use `<NEXUS_FQDN>:5000` and the internal CA makes TLS work.
+
+**Cloud / quick-test (AWS) path — insecure registry:**
+
+1. Open OS firewall **and** AWS Security Group for 8082 and 8083:
+   ```bash
+   firewall-cmd --permanent --add-port=8082/tcp
+   firewall-cmd --permanent --add-port=8083/tcp
+   firewall-cmd --reload
+   ```
+   AWS Console → EC2 → Security Groups → add inbound TCP 8082 and 8083 from your IP.
+
+2. On the Docker client, mark the registry as insecure (`/etc/docker/daemon.json`):
+   ```json
+   { "insecure-registries": ["<ec2-public-ip>:8082", "<ec2-public-ip>:8083"] }
+   ```
+   ```bash
+   sudo systemctl restart docker
+   ```
+
+3. Use it:
+   ```bash
+   docker login <ec2-public-ip>:8083
+   docker pull  <ec2-public-ip>:8083/library/alpine:3.19          # via group
+   docker tag   myapp:1.0 <ec2-public-ip>:8082/myteam/myapp:1.0
+   docker push  <ec2-public-ip>:8082/myteam/myapp:1.0             # direct to hosted
+   ```
+
+> The insecure-registry shortcut is **test only**. Move to §12 (NGINX + TLS + port 5000) before any real use — even for an internal dev instance.
+
+### 20.3 PyPI (pypi.org)
+
+**Create in UI:**
+
+| Repo | Recipe | Key settings |
+|---|---|---|
+| `pypi-proxy` | `pypi (proxy)` | Remote: `https://pypi.org/` |
+| `pypi-hosted` | `pypi (hosted)` | For internal wheels uploaded via `twine` |
+| `pypi-group` | `pypi (group)` | Members: `pypi-hosted`, `pypi-proxy` |
+
+**Client (`~/.pip/pip.conf` on Linux/macOS, `%APPDATA%\pip\pip.ini` on Windows):**
+```ini
+[global]
+index-url = <NEXUS_URL>/repository/pypi-group/simple/
+trusted-host = nexus.dev.contoso.internal    # only needed if no TLS, or internal CA not trusted
+```
+
+```bash
+pip install requests
+# upload a private wheel
+twine upload --repository-url <NEXUS_URL>/repository/pypi-hosted/ dist/*
+```
+
+### 20.4 Other common formats (same 3-repo pattern)
+
+| Format | Recipe | Upstream URL for proxy | Already pre-created? |
+|---|---|---|---|
+| Maven Central | `maven2 (proxy)` | `https://repo1.maven.org/maven2/` | Yes — `maven-central` (see §13) |
+| NuGet v3 | `nuget (proxy)` | `https://api.nuget.org/v3/index.json` | Yes — `nuget.org-proxy` |
+| Helm | `helm (proxy)` | e.g. `https://charts.bitnami.com/bitnami` | No |
+| apt (Debian/Ubuntu) | `apt (proxy)` | e.g. `http://archive.ubuntu.com/ubuntu/` | No — needs GPG keypair configured |
+| yum (RHEL/CentOS) | `yum (proxy)` | e.g. `https://download.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/` | No |
+| Raw (anything HTTP) | `raw (proxy/hosted/group)` | Any generic HTTP root | No |
+| Go modules | `go (proxy/group)` | `https://proxy.golang.org` | No |
+
+Repeat the **proxy + hosted + group** recipe for each format you need. The group URL is always the one clients consume.
+
+### 20.5 Users, roles, and tokens for clients
+
+Before you point CI at Nexus, create non-admin service users:
+
+UI → **Security → Users → Create local user**:
+
+| User | Typical roles | Use |
+|---|---|---|
+| `svc-ci-deploy` | `nx-repository-view-maven2-*-*` + `nx-repository-view-docker-*-*` + `nx-apikey-all` | Jenkins / GitHub Actions pushing artifacts + images |
+| `svc-ci-read` | `nx-repository-view-*-*-read` | Resolve-only user for builds that only pull |
+| Individual devs | `nx-anonymous` off, use AD mapping (§14.6) | Human identities |
+
+For integrations that only accept tokens (npm, PyPI, Docker), the user generates a **User Token** from their profile (top-right avatar → **User token**) once anonymous access is disabled. In CI, store these as secrets — never commit them.
+
+### 20.6 Cleanup, tasks, and capacity management
+
+After a few weeks the blob store balloons. Set this up early:
+
+1. UI → **Repository → Cleanup Policies → Create**: one per format, e.g. *"npm: delete if not downloaded in 60 days"*.
+2. Attach the policy to every proxy repo (**Repositories → repo → Cleanup**).
+3. UI → **System → Tasks → Create task**:
+   - **Admin - Cleanup repositories using their associated policies** — daily.
+   - **Admin - Compact blob store** — weekly (off-hours; I/O heavy).
+   - **Admin - Export databases for backup** — daily (see §15).
+
+### 20.7 Works the same on-prem and in cloud
+
+Everything in §20 is UI/REST only — it does not care whether the VM is on VMware, RHEL on bare metal, or EC2. The only differences between on-prem and cloud are:
+
+| Concern | On-prem (RHEL VM) | AWS / cloud |
+|---|---|---|
+| URL exposed to clients | `<NEXUS_URL> = https://<NEXUS_FQDN>` via §11 NGINX TLS | `http://<ec2-public-ip>:8081` (test) or NGINX+ACM behind an ALB (real) |
+| Docker registry host | `<NEXUS_FQDN>:5000` | `<ec2-public-ip>:8083` (insecure) or an ALB/NLB fronted FQDN |
+| Firewall to open | `firewalld` on the VM (`firewall-cmd --add-port=...`) | `firewalld` **plus** the AWS Security Group inbound rules |
+| CA trust for clients | Internal root CA → `update-ca-trust` and `/etc/docker/certs.d/…/ca.crt` | Public ACM cert (ALB) works out of the box; otherwise same as on-prem |
+| Stable address | Static IP assigned by network team (doesn't move) | **Attach an Elastic IP** — public IPv4 changes on every stop/start otherwise |
+
+---
+
+## 21. Troubleshooting walkthroughs (problems we have actually seen)
+
+§18 is the quick-reference matrix. This section is the diagnostic order for the failures that repeatedly bite people on first install, with the exact commands to run.
+
+### 21.1 "Can Nexus see me? Am I running?" — baseline service checks
+
+Always start here before chasing network issues:
+
+```bash
+# Unit-file view
+systemctl status nexus --no-pager -l
+systemctl is-active nexus        # active
+systemctl is-enabled nexus       # enabled
+
+# Is something listening on 8081, and as whom?
+sudo ss -tlnp | grep 8081
+# Expect:  LISTEN 0 50  *:8081 *:*  users:(("java",pid=...,fd=...))
+
+# Local HTTP — proves the JVM answered
+curl -I http://localhost:8081
+# Expect: HTTP/1.1 200 OK  Server: Nexus/<ver> (OSS)
+
+# Live application log
+sudo tail -f /nexus-data/sonatype-work/nexus3/log/nexus.log
+# (for tarballs installed into /opt/sonatype/nexus-<ver>/ with no dedicated disk:
+#  /opt/sonatype/sonatype-work/nexus3/log/nexus.log)
+```
+
+Interpret:
+- `LISTEN` binding is `127.0.0.1:8081` (not `*:8081`) → Nexus only listens on localhost. Fix in `nexus.properties`: `application-host=0.0.0.0`, restart (§7).
+- No LISTEN at all + active service → JVM still starting (wait up to ~2 min on first boot), or silently failed (check `nexus.log`).
+- `systemctl status` shows `Active: failed` → jump to §21.2 based on the reason line.
+
+### 21.2 `Active: failed (Result: oom-kill)` — the Linux OOM killer took Nexus out
+
+Symptom (from `systemctl status nexus`):
+```
+Active: failed (Result: oom-kill) ...
+Main PID: 1327 (code=killed, signal=KILL)
+nexus.service: A process of this unit has been killed by the OOM killer.
+```
+
+Meaning: the kernel ran out of RAM and force-killed the Nexus JVM to keep the system alive. This is **not** a Nexus bug — the VM is undersized. Nexus 3.71+ wants ~4 GB RAM minimum.
+
+**Confirm:**
+```bash
+free -h
+sudo dmesg -T | grep -iE 'oom|killed process' | tail
+# You'll see "Out of memory: Killed process ... java"
+```
+
+**Fix — on-prem (VMware):** ask the VMware team to increase the VM to the sizing in §1 (8 GB RAM for a small/medium instance). Power off, raise RAM, power on. No data loss.
+
+**Fix — AWS:** stop the instance, change instance type to at least `t3.medium` (4 GB) or `t3.large` (8 GB), start again. Full procedure:
+
+1. EC2 Console → Instances → select → **Instance state → Stop instance**. Wait until `stopped`.
+2. **Actions → Instance settings → Change instance type** → pick e.g. `t3.large` → Save.
+3. **Instance state → Start instance**.
+4. SSH back in, `free -h` to confirm, `systemctl status nexus` (auto-starts because it's `enabled`).
+
+**Caveats on stop/start in AWS:**
+- **Public IP changes** unless you've allocated an **Elastic IP**. Your security group, DNS, and client-side configs that use the old IP all break.
+- **Private IP stays the same** (within the same subnet).
+- **EBS-backed data (`/nexus-data`, `/opt/sonatype`) persists.** Instance-store data would be lost — Nexus wouldn't be installed on that anyway.
+
+**Last-resort shrink (not recommended):** on a ≤2 GB VM you can try lowering the heap, but Nexus will be slow and flaky:
+```bash
+sed -i 's/^-Xms.*/-Xms512M/; s/^-Xmx.*/-Xmx512M/; s/^-XX:MaxDirectMemorySize=.*/-XX:MaxDirectMemorySize=512M/' \
+  /opt/sonatype/nexus-3.71.0-06/bin/nexus.vmoptions
+systemctl restart nexus
+```
+Better: resize.
+
+### 21.3 `curl -I http://localhost:8081` — `Connection refused`
+
+On the Nexus VM itself. This means nothing is listening on 8081 locally.
+
+```bash
+# 1. Is the service even running?
+systemctl status nexus --no-pager -l
+
+# 2. If running, where are the logs? On some installs the path is different.
+sudo find / -name "nexus.log"      2>/dev/null
+sudo find / -type d -name "sonatype-work" 2>/dev/null
+# Common real locations:
+#   /nexus-data/sonatype-work/nexus3/log/nexus.log   (dedicated disk, this runbook)
+#   /opt/sonatype/sonatype-work/nexus3/log/nexus.log (no dedicated disk)
+
+# 3. Service logs (always available, even if nexus.log doesn't exist yet)
+sudo journalctl -u nexus -n 200 --no-pager
+```
+
+Common outcomes and fixes:
+
+| What you see | Cause | Fix |
+|---|---|---|
+| `tail: /opt/sonatype/sonatype-work/nexus3/log/nexus.log: No such file or directory` | You're looking at the wrong install path. | Use `find` above to locate the real `sonatype-work/`. Typically `/opt/sonatype/nexus-<ver>/` is installed, `sonatype-work/` is a sibling or under `/nexus-data/`. |
+| `No suitable Java Virtual Machine could be found ... must be 17` | Missing / wrong Java, or `INSTALL4J_JAVA_HOME_OVERRIDE` not set | Re-do §2.1 and §6. |
+| `Permission denied` writing sonatype-work | Ownership wrong | `chown -R nexus:nexus /opt/sonatype /nexus-data` |
+| `Active: failed (Result: oom-kill)` | RAM exhausted | §21.2 |
+| Service running, LISTEN shows only `127.0.0.1:8081` | Bound to loopback | §7 — set `application-host=0.0.0.0` |
+
+### 21.4 From outside the VM: `Connection refused` / `Operation timed out`
+
+Interpret the error literally — they mean different things:
+
+| Error from `nc -vz <host> 8081` (or browser) | What it means |
+|---|---|
+| `succeeded!` / HTTP 200 | Network is fine; problem (if any) is application-level. |
+| `Operation timed out` | A firewall silently dropped the packet. Something between you and the VM. |
+| `Connection refused` | Something **answered** but nothing is listening on that port there — often you're reaching the wrong host (e.g. a recycled public IP). |
+| `Host is unreachable` / `No route to host` | Routing/DNS problem; wrong IP, VPN not connected, etc. |
+
+**Diagnostic order:**
+
+1. **Confirm you have the right address right now.**
+   - On-prem: `ip -br a` on the VM matches what your DNS resolves to? `dig +short nexus.dev.contoso.internal` returns the right IP?
+   - AWS: the public IP **changes on every stop/start** unless an Elastic IP is attached. Re-check:
+     ```bash
+     # From inside the instance (IMDSv2)
+     TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+       -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+     curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+       http://169.254.169.254/latest/meta-data/public-ipv4; echo
+     ```
+     Or Console → EC2 → Instances → your instance → **Public IPv4 address**.
+
+2. **Prove the VM itself is healthy — from the VM:**
+   ```bash
+   curl -I http://localhost:8081          # should be 200
+   curl -I http://<vm-own-public-or-fqdn>:8081   # should also be 200
+   ```
+   If `localhost:8081` works but `<public-ip>:8081` from the VM itself doesn't, it's a **host firewall** issue (§21.5), not a cloud/SG issue.
+
+3. **Test the port from your workstation:**
+   ```bash
+   nc -vz <host> 8081
+   ```
+   - Timed out → firewall in the path (host firewalld §21.5, AWS Security Group §21.6, corporate egress filter).
+   - Refused → wrong IP / recycled address / service bound to loopback only.
+
+### 21.5 `firewalld` on RHEL is blocking 8081 (or 5000, 8082, 8083)
+
+Symptom: from the VM, `curl localhost:8081` works. From outside, `nc -vz` times out. `systemctl status firewalld` shows it active.
+
+```bash
+sudo systemctl status firewalld
+sudo firewall-cmd --list-all
+```
+
+If the `ports:` line doesn't include `8081/tcp`, open it:
+```bash
+sudo firewall-cmd --permanent --add-port=8081/tcp
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-all | grep ports
+```
+
+Remember to open every port you use:
+- `8081/tcp` — Nexus UI + HTTP API
+- `443/tcp` (add `--add-service=https`) — if NGINX TLS from §11 is in front
+- `5000/tcp` — Docker registry via NGINX (§12)
+- `8082, 8083/tcp` — only if exposing Docker connectors directly (§20.2 cloud path)
+
+### 21.6 AWS Security Group is blocking the port
+
+Symptom: `firewalld` allows 8081 and `curl localhost:8081` works on the VM, but from your Mac `nc -vz <public-ip> 8081` times out.
+
+Fix — AWS Console → **EC2 → Instances → your instance → Security tab → click the SG** → **Edit inbound rules → Add rule**:
+
+| Field | Value |
+|---|---|
+| Type | Custom TCP |
+| Port range | `8081` (repeat for 5000 / 8082 / 8083 / 443 as needed) |
+| Source | **My IP** (locks to your current public egress IP) or a tighter CIDR; avoid `0.0.0.0/0` |
+| Description | `Nexus UI` |
+
+Common misses:
+- Edited the wrong SG — an instance can have multiple; check the Security tab on the instance page to see which ones are attached.
+- Your own public IP changed (home/office). Re-check with https://checkip.amazonaws.com, update the rule.
+- NACLs on the subnet explicitly deny the port (rare in default VPCs; check VPC → Network ACLs).
+
+### 21.7 EC2 public IP disappeared after stop/start
+
+Symptom: after stopping+starting the instance, IMDSv2 returns an empty `public-ipv4`, or the Console shows a blank **Public IPv4 address**.
+
+Cause: the instance is in a subnet/launch configuration without **auto-assign public IPv4**, and no Elastic IP is attached. Stopping releases the ephemeral public IP; on start, the subnet default decides whether a new one is given.
+
+**Fix — attach an Elastic IP (do this once, permanently solves it):**
+
+1. AWS Console → **EC2 → Elastic IPs → Allocate Elastic IP address** → Allocate.
+2. Select the new EIP → **Actions → Associate Elastic IP address** → Resource type: Instance → pick your Nexus instance → **Associate**.
+3. Update:
+   - Your DNS (`nexus.dev.contoso.internal` A-record if you use one) to the EIP.
+   - Any `/etc/hosts` pins on client machines.
+   - Security Group rule sources if they restricted by your IP (those don't change, but double-check).
+4. `nc -vz <eip> 8081` from your workstation to confirm.
+
+The EIP survives stop/start and reboot. It's released only when you explicitly dissociate and release it.
+
+### 21.8 UI works but Docker client fails
+
+Most common on first use of §12 / §20.2:
+
+| Error from `docker login/pull/push` | Fix |
+|---|---|
+| `x509: certificate signed by unknown authority` | Internal CA not trusted on the client. Copy `<INTERNAL_CA_CRT>` to `/etc/docker/certs.d/<fqdn>:5000/ca.crt` and `sudo systemctl restart docker`. |
+| `Get "https://<host>:5000/v2/": http: server gave HTTP response to HTTPS client` | You're hitting the raw Nexus connector (HTTP) but Docker expects TLS. Either put NGINX in front with TLS (§12) or add `"insecure-registries": ["<host>:<port>"]` to `/etc/docker/daemon.json`. |
+| `denied: access to the requested resource is not authorized` | Missing **Docker Bearer Token Realm** (Security → Realms), or user lacks the role for that repo. |
+| `413 Request Entity Too Large` on push | NGINX default 1 MB body limit — set `client_max_body_size 4G;` in the server block (§12) and reload. |
+| Push hangs then times out | NGINX proxy timeouts too low — raise `proxy_read_timeout` to at least 900s (§12). |
+
+### 21.9 Diagnostic cheat sheet (copy-paste)
+
+Run the whole block when you don't know where to start:
+
+```bash
+echo "=== systemd ==="
+systemctl status nexus --no-pager -l | head -30
+echo "=== listening sockets ==="
+sudo ss -tlnp | grep -E ':(8081|8082|8083|5000|443)\b' || echo "nothing listening"
+echo "=== local HTTP ==="
+curl -sS -I http://localhost:8081 | head -5 || true
+echo "=== firewall ==="
+sudo firewall-cmd --list-all 2>/dev/null | grep -E 'services|ports' || echo "firewalld not active"
+echo "=== memory ==="
+free -h
+echo "=== last nexus.log lines ==="
+sudo tail -n 50 /nexus-data/sonatype-work/nexus3/log/nexus.log 2>/dev/null \
+  || sudo tail -n 50 /opt/sonatype/sonatype-work/nexus3/log/nexus.log 2>/dev/null \
+  || echo "nexus.log not found — run: sudo find / -name nexus.log 2>/dev/null"
+echo "=== last journal lines ==="
+sudo journalctl -u nexus -n 50 --no-pager
+```
+
+Paste the output into whatever ticket/chat you're escalating to — it covers every layer from systemd down to the application log in one go.
 
 ---
 
