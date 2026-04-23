@@ -22,30 +22,30 @@ The plan is dependency-driven and suitable for client sign-off, delivery trackin
 flowchart TB
     subgraph DC[On-Prem DEV Data Center]
         subgraph S1[Physical Server 1 - Dell EMC PowerEdge R750]
-            CP1[Control Plane 1<br/>8 vCPU | 64 GB | 300 GB<br/>Dedicated / Unschedulable]
-            W1[Worker 1<br/>20 vCPU | 512 GB | ~1.3 TB usable]
-            VM3[VM3 CI/CD Stack<br/>16 vCPU | 96 GB | 600 GB]
-            VM12[VM12 Secrets<br/>4 vCPU | 16 GB | 150 GB]
+            CP1[Control Plane 1<br/>8 vCPU, 64 GB RAM, 300 GB disk<br/>Dedicated / Unschedulable]
+            W1[Worker 1<br/>20 vCPU, 512 GB RAM, ~1.3 TB usable]
+            VM3[VM3 CI/CD Stack<br/>16 vCPU, 96 GB RAM, 600 GB disk]
+            VM12[VM12 Secrets<br/>4 vCPU, 16 GB RAM, 150 GB disk]
             W1 --> VM3
             W1 --> VM12
         end
 
         subgraph S2[Physical Server 2 - Dell EMC PowerEdge R750]
-            CP2[Control Plane 2<br/>8 vCPU | 64 GB | 300 GB<br/>Dedicated / Unschedulable]
-            W2[Worker 2<br/>20 vCPU | 512 GB | ~1.3 TB usable]
-            VM10[VM10 MS SQL Server 2022<br/>16 vCPU | 128 GB | 800 GB]
-            VM11[VM11 ActiveMQ Existing<br/>4 vCPU | 16 GB | 200 GB]
+            CP2[Control Plane 2<br/>8 vCPU, 64 GB RAM, 300 GB disk<br/>Dedicated / Unschedulable]
+            W2[Worker 2<br/>20 vCPU, 512 GB RAM, ~1.3 TB usable]
+            VM10[VM10 MS SQL Server 2022<br/>16 vCPU, 128 GB RAM, 800 GB disk]
+            VM11[VM11 ActiveMQ Existing<br/>4 vCPU, 16 GB RAM, 200 GB disk]
             W2 --> VM10
             W2 --> VM11
         end
 
         subgraph S3[Physical Server 3 - Dell EMC PowerEdge R750]
-            CP3[Control Plane 3<br/>8 vCPU | 64 GB | 300 GB<br/>Dedicated / Unschedulable]
-            W3[Worker 3<br/>20 vCPU | 512 GB | ~1.3 TB usable]
-            VM6[VM6 F5 NGINX API Gateway<br/>4 vCPU | 16 GB | 80 GB]
-            VM7[VM7 Kafka + Cache<br/>8 vCPU | 64 GB | 500 GB]
-            VM8[VM8 ELK + Grafana 1<br/>8 vCPU | 64 GB | 600 GB]
-            VM9[VM9 ELK + Grafana 2<br/>8 vCPU | 64 GB | 600 GB]
+            CP3[Control Plane 3<br/>8 vCPU, 64 GB RAM, 300 GB disk<br/>Dedicated / Unschedulable]
+            W3[Worker 3<br/>20 vCPU, 512 GB RAM, ~1.3 TB usable]
+            VM6[VM6 F5 NGINX API Gateway<br/>4 vCPU, 16 GB RAM, 80 GB disk]
+            VM7[VM7 Kafka + Cache<br/>8 vCPU, 64 GB RAM, 500 GB disk]
+            VM8[VM8 ELK + Grafana 1<br/>8 vCPU, 64 GB RAM, 600 GB disk]
+            VM9[VM9 ELK + Grafana 2<br/>8 vCPU, 64 GB RAM, 600 GB disk]
             W3 --> VM6
             W3 --> VM7
             W3 --> VM8
@@ -80,7 +80,7 @@ flowchart LR
     Admin[Platform / Delivery Admins]
     DevUsers[Developers / QA / Security Users]
     OOB[OOB Management Network<br/>iDRAC / BMC]
-    Jump[RHEL Bastion / Jump Host<br/>oc | virtctl | openshift-install]
+    Jump[RHEL Bastion / Jump Host<br/>oc, virtctl, openshift-install]
     DNS[Enterprise DNS]
     NTP[Enterprise NTP]
     IDP[AD / LDAP / SSO]
