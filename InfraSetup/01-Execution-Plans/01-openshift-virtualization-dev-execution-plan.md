@@ -20,56 +20,43 @@ The plan is dependency-driven and suitable for client sign-off, delivery trackin
 
 ```mermaid
 flowchart TB
-    subgraph DC[On-Prem DEV Data Center]
-        subgraph S1[Physical Server 1 - Dell EMC PowerEdge R750]
-            CP1[Control Plane 1<br/>8 vCPU, 64 GB RAM, 300 GB disk<br/>Dedicated / Unschedulable]
-            W1[Worker 1<br/>20 vCPU, 512 GB RAM, ~1.3 TB usable]
-            VM3[VM3 CI/CD Stack<br/>16 vCPU, 96 GB RAM, 600 GB disk]
-            VM12[VM12 Secrets<br/>4 vCPU, 16 GB RAM, 150 GB disk]
-            W1 --> VM3
-            W1 --> VM12
+    subgraph DC[On-Prem DEV OpenShift Platform]
+        subgraph S1[Physical Server 1]
+            CP1[Control Plane 1<br/>Dedicated, Not Schedulable]
+            W1[Worker 1]
+            W1 --> VM3[VM3 CI/CD]
+            W1 --> VM12[VM12 Secrets]
         end
 
-        subgraph S2[Physical Server 2 - Dell EMC PowerEdge R750]
-            CP2[Control Plane 2<br/>8 vCPU, 64 GB RAM, 300 GB disk<br/>Dedicated / Unschedulable]
-            W2[Worker 2<br/>20 vCPU, 512 GB RAM, ~1.3 TB usable]
-            VM10[VM10 MS SQL Server 2022<br/>16 vCPU, 128 GB RAM, 800 GB disk]
-            VM11[VM11 ActiveMQ Existing<br/>4 vCPU, 16 GB RAM, 200 GB disk]
-            W2 --> VM10
-            W2 --> VM11
+        subgraph S2[Physical Server 2]
+            CP2[Control Plane 2<br/>Dedicated, Not Schedulable]
+            W2[Worker 2]
+            W2 --> VM10[VM10 SQL Server 2022]
+            W2 --> VM11[VM11 ActiveMQ]
         end
 
-        subgraph S3[Physical Server 3 - Dell EMC PowerEdge R750]
-            CP3[Control Plane 3<br/>8 vCPU, 64 GB RAM, 300 GB disk<br/>Dedicated / Unschedulable]
-            W3[Worker 3<br/>20 vCPU, 512 GB RAM, ~1.3 TB usable]
-            VM6[VM6 F5 NGINX API Gateway<br/>4 vCPU, 16 GB RAM, 80 GB disk]
-            VM7[VM7 Kafka + Cache<br/>8 vCPU, 64 GB RAM, 500 GB disk]
-            VM8[VM8 ELK + Grafana 1<br/>8 vCPU, 64 GB RAM, 600 GB disk]
-            VM9[VM9 ELK + Grafana 2<br/>8 vCPU, 64 GB RAM, 600 GB disk]
-            W3 --> VM6
-            W3 --> VM7
-            W3 --> VM8
-            W3 --> VM9
+        subgraph S3[Physical Server 3]
+            CP3[Control Plane 3<br/>Dedicated, Not Schedulable]
+            W3[Worker 3]
+            W3 --> VM6[VM6 NGINX API Gateway]
+            W3 --> VM7[VM7 Kafka and Cache]
+            W3 --> VM8[VM8 ELK and Grafana 1]
+            W3 --> VM9[VM9 ELK and Grafana 2]
         end
 
         CP1 --- CP2
         CP2 --- CP3
     end
 
+    DNS[DNS]
+    NTP[NTP]
+    IDP[AD / LDAP / SSO]
     APIVIP[API VIP]
     INGVIP[Ingress VIP]
-    DNS[Enterprise DNS]
-    NTP[Enterprise NTP]
-    IDP[AD/LDAP/SSO]
 
     DNS --> APIVIP
     DNS --> INGVIP
-    NTP --> CP1
-    NTP --> CP2
-    NTP --> CP3
-    NTP --> W1
-    NTP --> W2
-    NTP --> W3
+    NTP --> DC
     IDP --> DC
 ```
 
@@ -77,37 +64,34 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    Admin[Platform / Delivery Admins]
-    DevUsers[Developers / QA / Security Users]
-    OOB[OOB Management Network<br/>iDRAC / BMC]
-    Jump[RHEL Bastion / Jump Host<br/>oc, virtctl, openshift-install]
-    DNS[Enterprise DNS]
-    NTP[Enterprise NTP]
+    Users[Developers, QA, Security Users]
+    Admin[Platform and Delivery Admins]
+    OOB[OOB Management<br/>iDRAC]
+    Jump[RHEL Bastion]
+    FW[Firewall Controls]
+    VIP[API VIP and Ingress VIP]
+    DNS[DNS]
+    NTP[NTP]
     IDP[AD / LDAP / SSO]
-    FW[Client Firewall Controls]
-    LB[Client-Approved VIP Delivery<br/>API VIP + Ingress VIP]
 
     subgraph OCP[OpenShift Cluster]
         CP[3 Dedicated Control Plane Nodes]
-        WK[3 Dedicated Worker Nodes]
-        VMS[OpenShift Virtualization VMs on Workers Only]
+        WK[3 Worker Nodes]
+        VMS[OpenShift Virtualization VMs]
         CP --> WK
         WK --> VMS
     end
 
     Admin --> OOB
     Admin --> Jump
-    DevUsers --> FW
+    Users --> FW
     Jump --> FW
-    FW --> LB
-    FW --> CP
-    FW --> WK
-    DNS --> LB
+    FW --> VIP
+    VIP --> OCP
+    DNS --> VIP
     DNS --> OCP
     NTP --> OCP
     IDP --> OCP
-    LB --> CP
-    LB --> WK
 ```
 
 ## 1) Pre-Execution Dependencies & Prerequisites
@@ -128,9 +112,11 @@ Execution is contingent upon the client providing all prerequisite hardware read
 
 - Client-approved VLANs, subnets, gateways, MTU, routing domains, and switch port configuration must be available for all OpenShift node networks and supporting services.
 - API VIP and Ingress VIP addresses must be reserved before installation.
+- If outbound proxying is required, the client must provide proxy URLs, `noProxy` values, and the approved egress allow-list for OpenShift, Operator, guest OS, and tool installation traffic.
 - Required DNS records must be created before Phase 3, including `api`, `api-int`, and `*.apps` records for the selected cluster name and base domain.
 - Forward and reverse DNS records must exist for every control plane node, worker node, bastion host, and any supporting infrastructure endpoint used during install.
 - Enterprise NTP must be reachable from every node and from the bastion host.
+- VIP health-check behavior, failover behavior, and monitoring method for the client-approved API VIP and Ingress VIP delivery mechanism must be defined before Phase 2 closes.
 - Firewall paths must be approved for node-to-node traffic, bastion-to-cluster administration, outbound access to Red Hat content or the client-provided mirror, and workload-to-enterprise-service connectivity.
 - AD, LDAP, or SSO endpoints intended for cluster authentication must be reachable from the cluster and validated by the security team.
 - The client must define the supported method used to deliver API and Ingress VIP functionality on-premises. This plan does not assume a specific external appliance or software component.
@@ -150,6 +136,8 @@ Execution is contingent upon the client providing all prerequisite hardware read
 - A supported RHCOS-based installation workflow must be approved by the client for the six target OpenShift nodes.
 - A bastion or jump host must be available for delivery execution. If the client does not already provide one, a RHEL 8 or RHEL 9 bastion host is required to host `oc`, `virtctl`, `openshift-install`, SSH keys, and installation artifacts.
 - Red Hat pull secret, subscription entitlements, and any required registry access or mirrored content source must be available before installation begins.
+- SSH public keys, bastion hardening baseline, endpoint protection requirements, and approved administrative tooling for the jump host must be provided before execution begins.
+- If the environment is disconnected or proxied, the client must provide the approved mirror-registry design, image source list, and bastion-level proxy configuration before Phase 3.
 - Guest operating system templates or installation media for each VM must be provided or approved by the client before VM provisioning.
 
 ### 1.5 Security Prerequisites
@@ -160,6 +148,12 @@ Execution is contingent upon the client providing all prerequisite hardware read
 - The target RBAC model for cluster administration, virtualization administration, application administration, and read-only audit access must be approved.
 - Security scanning endpoints, proxy rules, license servers, and update paths required by Aqua, Checkmarx, SonarQube, and related tools must be reachable.
 - Audit log forwarding targets, SIEM or syslog destinations, and log retention requirements for DEV must be defined.
+- The enterprise security hardening baseline for RHCOS, the bastion host, Linux guest VMs, and any Windows guest VMs must be provided or formally waived.
+- MFA, privileged access management, session-recording, and password-vaulting requirements for administrative access must be defined before privileged access is granted.
+- Vulnerability-scanning scope, scan windows, remediation SLAs, and exception-management process for the cluster, bastion host, and guest VMs must be approved.
+- Endpoint detection and response, anti-malware, or host-based security-agent requirements for guest VMs must be supplied with required exclusions for OpenShift and application tooling before Phase 8.
+- Compliance classification for the DEV environment, evidence-retention period, log-retention period, and CMDB or asset-registration requirements must be defined by the client.
+- Certificate renewal ownership, service-account rotation cadence, encryption standards, and DEV backup-encryption expectations must be defined before handover.
 - The client must select either HashiCorp Vault or CyberArk for VM12 before Phase 8.
 
 ### 1.6 Access Prerequisites
@@ -168,6 +162,8 @@ Execution is contingent upon the client providing all prerequisite hardware read
 - SSH access method, console access method, and privileged escalation process for all guest operating systems must be approved.
 - Change windows, maintenance windows, rollback authority, and client approvers must be named before infrastructure changes begin.
 - Access to the target source control repository and any internal package repositories or license portals required during tool installation must be available.
+- Named service accounts or integration accounts for identity, logging, monitoring, backup, and package-repository access must be created or explicitly declared out of scope before execution.
+- VPN, jump-host allow-listing, MFA enforcement, and emergency-access approval paths for delivery resources must be approved before Phase 1 begins.
 
 ### 1.7 Hypervisor and Virtualization Confirmation
 
@@ -186,10 +182,14 @@ Execution is contingent upon the client providing all prerequisite hardware read
 | Apps wildcard DNS | `*.apps.<cluster>.<baseDomain>` resolves to Ingress VIP | Network | Phase 2 |
 | Node DNS | A and PTR records for 3 control plane nodes, 3 worker nodes, bastion host, and supporting endpoints | Network | Phase 2 |
 | VIP allocation | One API VIP and one Ingress VIP reserved and routable | Network | Phase 2 |
+| Proxy and `noProxy` | If required, approved proxy settings and allow-list for OpenShift, Operators, guest OS, and tool downloads | Network and Security | Phase 2 |
+| Content source reachability | Red Hat registry access or approved internal mirror reachable from bastion and cluster networks | Client and Security | Phase 2 |
 | Firewall readiness | North-south, east-west, admin, identity, NTP, DNS, registry, and tooling paths approved | Security and Network | Phase 2 |
 | NTP | All nodes and bastion host can sync to approved NTP sources | Network | Phase 2 |
 | AD/LDAP/SSO | Identity source reachable with approved bind or trust details | Security | Phase 4 |
 | RBAC readiness | Admin groups, virtualization admins, app owners, and audit roles approved | Security and Client | Phase 4 |
+| PAM and MFA | Privileged-access path for bastion, cluster, and guest VMs approved and operational | Security | Phase 4 |
+| SIEM and retention | Audit-log destination and retention requirements approved | Security | Phase 4 |
 
 ## 2) Dependency & Ownership Matrix
 
@@ -201,6 +201,7 @@ Execution is contingent upon the client providing all prerequisite hardware read
 | Six-node realization method | Supported method for 3 control plane and 3 worker nodes on 3 servers approved | Client and Platform | Phase 0 | Signed design decision record |
 | OpenShift version selection | Client-approved OCP release and supported OpenShift Virtualization release | Client and Platform | Phase 0 | Version approval record |
 | Content source | Internet egress or client mirror for OpenShift and Operators | Client and Security | Phase 2 | Registry reachability test |
+| Proxy and `noProxy` values | Approved proxy configuration and allow-list for bastion, cluster, and guest workload installation traffic | Network and Security | Phase 2 | Bastion connectivity validation |
 | VLANs and subnets | All network segments, routing, MTU, and gateway details provided | Network | Phase 2 | Approved network sheet |
 | DNS records | Node, API, API-int, and apps wildcard records created | Network | Phase 2 | Forward and reverse lookup validation |
 | VIP delivery method | API and Ingress VIP implementation approved | Network | Phase 2 | VIP design sign-off |
@@ -210,6 +211,10 @@ Execution is contingent upon the client providing all prerequisite hardware read
 | Certificates and CA | Cluster and application certificate requirements approved | Security | Phase 4 | Certificate inventory and trust validation |
 | AD/LDAP/SSO details | Identity source, groups, and mapping rules approved | Security | Phase 4 | Authentication test plan |
 | RBAC model | Admin, operator, app-owner, and audit roles approved | Security and Client | Phase 4 | RBAC matrix sign-off |
+| Hardening baseline | Approved OS and platform hardening standard for bastion and guest VMs | Security and Platform | Phase 4 | Baseline control review |
+| PAM and MFA controls | Privileged access, session recording, and break-glass workflow approved | Security | Phase 4 | PAM and MFA access test |
+| Vulnerability and EDR onboarding | Vulnerability scanning, EDR or anti-malware deployment plan, and exception path approved | Security | Phase 4 | Security tooling readiness review |
+| SIEM and evidence retention | Audit-log destination, log retention, and evidence-retention controls approved | Security | Phase 4 | SIEM onboarding confirmation |
 | Local storage layout | Local SSD partitioning or presentation confirmed for CP, worker, and VM disk use | Platform | Phase 6 | Storage layout sign-off |
 | Worker-3 capacity decision | CPU overcommit and local-disk shortfall disposition approved | Client and Platform | Phase 0 | Signed capacity exception or client decision |
 | VM guest OS media | Templates or ISO media for all required VMs available | Client | Phase 7 | Media checksum and accessibility validation |
@@ -250,14 +255,14 @@ Confirm that the fixed architecture, dependencies, installation approach, and ca
 - Decision log for unresolved client items.
 - Approved implementation calendar.
 
-**Validation Tests with Expected Results**
+**Validation Commands/Tests with Expected Results**
 
-| Validation Test | Expected Result |
+| Validation Command/Test | Expected Result |
 |---|---|
-| Hardware inventory review | Exactly three Dell EMC PowerEdge R750 servers match the fixed specification |
-| Worker capacity review | Worker-1 and Worker-2 fit fixed sizing; Worker-3 shortfall is documented and dispositioned |
-| Installation-method review | Client-approved method for six OpenShift nodes on three servers is recorded |
-| Dependency review | Every blocking item has an owner and a due phase |
+| Prerequisite tracker review against signed checklist | All blocking prerequisites are assigned owners and due phases |
+| Capacity workbook review of fixed VM totals versus worker sizing | Worker-1 and Worker-2 fit fixed sizing, and the Worker-3 shortfall is documented with approved disposition |
+| Decision log review | Six-node realization method, OpenShift version, and VIP delivery method are recorded as approved or assigned for closure |
+| Kickoff sign-off review | Client, network, security, platform, and DBA stakeholders are recorded as participants in readiness approval |
 
 **Exit Criteria**
 
@@ -299,14 +304,14 @@ Prepare all three physical servers to a common, supportable baseline for OpenShi
 - Hardware health evidence.
 - Final asset and interface inventory.
 
-**Validation Tests with Expected Results**
+**Validation Commands/Tests with Expected Results**
 
-| Validation Test | Expected Result |
+| Validation Command/Test | Expected Result |
 |---|---|
-| Firmware verification | All three servers show the approved firmware baseline |
-| BIOS verification | UEFI, VT-x, and VT-d are enabled consistently |
-| Hardware diagnostics | No critical health alarms remain |
-| BMC verification | Remote console and power control succeed on each server |
+| iDRAC hardware inventory export and health review | All three servers report healthy status and matching hardware profile |
+| BIOS settings review for UEFI, VT-x, and VT-d | Virtualization flags and boot mode are enabled consistently on all servers |
+| Firmware inventory comparison against approved baseline | BIOS, iDRAC, NIC, and storage-controller firmware match the approved version set |
+| Remote console and power-cycle test from iDRAC | Each server can be remotely mounted, rebooted, and observed successfully |
 
 **Exit Criteria**
 
@@ -346,14 +351,15 @@ Establish all required name resolution, VIP, timing, route, and firewall depende
 - Firewall approval record.
 - NTP validation evidence.
 
-**Validation Tests with Expected Results**
+**Validation Commands/Tests with Expected Results**
 
-| Validation Test | Expected Result |
+| Validation Command/Test | Expected Result |
 |---|---|
-| DNS lookup test | All node and cluster endpoint records resolve correctly forward and reverse |
-| VIP validation | API VIP and Ingress VIP addresses are reserved and reachable by design |
-| Firewall validation | Required ports and routes succeed between approved endpoints |
-| NTP validation | Time synchronization succeeds against approved NTP sources |
+| `nslookup api.<cluster>.<baseDomain>` and `nslookup api-int.<cluster>.<baseDomain>` from bastion | Both names resolve to the approved API VIP |
+| `nslookup test.apps.<cluster>.<baseDomain>` from bastion | Test wildcard application name resolves to the approved Ingress VIP |
+| `chronyc sources -v` from bastion | Approved NTP sources are reachable and selected |
+| `nc -vz <mirror-or-registry-endpoint> 443` and `nc -vz <idp-endpoint> 443` from bastion | Required outbound HTTPS paths are open |
+| Firewall rule test matrix executed by network and security teams | Approved ports and routes succeed between required endpoints |
 
 **Exit Criteria**
 
@@ -383,30 +389,34 @@ Install a six-node OpenShift cluster consisting of three dedicated control plane
 2. Create the installation configuration using the approved cluster name, base domain, and networking inputs.
 3. Define the six node identities: three dedicated control plane nodes and three dedicated worker nodes.
 4. Execute the client-approved Red Hat-supported installation workflow for the six-node layout.
-5. Validate that control plane nodes are unschedulable and workers are available for workload scheduling.
-6. Confirm all cluster operators reach stable state.
-7. Establish baseline administrative access from the bastion host.
+5. Confirm the cluster scheduler is configured with `mastersSchedulable=false` so control plane nodes remain dedicated and not schedulable for user workloads.
+6. Confirm control plane nodes retain the expected `NoSchedule` taints and that no user workloads or VMs can land on them.
+7. Confirm all cluster operators reach stable state.
+8. Establish baseline administrative access from the bastion host.
 
 **Outputs**
 
 - Running OpenShift cluster.
 - Bastion administration access.
 - Initial cluster configuration backup.
+- Evidence that control plane nodes are dedicated and not schedulable.
 
-**Validation Tests with Expected Results**
+**Validation Commands/Tests with Expected Results**
 
-| Validation Test | Expected Result |
+| Validation Command/Test | Expected Result |
 |---|---|
-| Node readiness | `oc get nodes` shows 3 Ready control plane nodes and 3 Ready worker nodes |
-| Scheduling state | Control plane nodes are unschedulable for workloads |
-| Cluster operators | Core cluster operators are Available and not Degraded |
-| API access | Cluster API reachable from approved admin network |
+| `oc get nodes` | Exactly 3 control plane nodes and 3 worker nodes show `Ready` state |
+| `oc get schedulers.config.openshift.io cluster -o jsonpath='{.spec.mastersSchedulable}'` | Returns `false` |
+| `oc get nodes -l node-role.kubernetes.io/master -o custom-columns=NAME:.metadata.name,UNSCHEDULABLE:.spec.unschedulable` | All control plane nodes show dedicated unschedulable state |
+| `oc describe node <control-plane-node> | grep -i Taints` | Each control plane node includes a `NoSchedule` taint and is not available for VM or user workload placement |
+| `oc get co` | Core cluster operators report `Available=True` and no blocking degraded state |
+| Bastion-to-API login test using `oc login` | Cluster API reachable from the approved admin network |
 
 **Exit Criteria**
 
 - Six-node cluster is stable.
 - Admin access works from the bastion host.
-- Control plane schedulability policy is confirmed.
+- Control plane nodes are confirmed dedicated and not schedulable for user workloads or VMs.
 
 **Rollback/Exit Plan**
 
@@ -440,14 +450,15 @@ Apply the minimum operational and security baseline required before enabling vir
 - Identity integration evidence.
 - Monitoring and audit baseline evidence.
 
-**Validation Tests with Expected Results**
+**Validation Commands/Tests with Expected Results**
 
-| Validation Test | Expected Result |
+| Validation Command/Test | Expected Result |
 |---|---|
-| SSO or directory login | Approved identity users can authenticate successfully |
-| RBAC review | Only approved groups have elevated roles |
-| Audit log verification | Audit events are generated and forwarded as designed |
-| Monitoring baseline | Cluster monitoring and alerts are healthy |
+| Browser or CLI SSO login test using an approved test identity | Approved identity users authenticate successfully |
+| `oc auth can-i` or `oc adm policy who-can` tests executed with approved test roles | Only approved groups hold elevated permissions |
+| `openssl s_client -connect <api-or-app-endpoint>:443 -showcerts` | Certificate chain matches the approved CA and is within validity period |
+| Audit-log forwarding test to approved SIEM or syslog destination | Audit events are generated and visible at the target destination |
+| `oc get co monitoring` and alerting baseline review | Cluster monitoring components are healthy and baseline alerts are present |
 
 **Exit Criteria**
 
@@ -485,14 +496,14 @@ Enable Red Hat OpenShift Virtualization on the worker nodes so that all applicat
 - HyperConverged configuration.
 - Virtualization administration model.
 
-**Validation Tests with Expected Results**
+**Validation Commands/Tests with Expected Results**
 
-| Validation Test | Expected Result |
+| Validation Command/Test | Expected Result |
 |---|---|
-| Operator health | OpenShift Virtualization Operator is installed and healthy |
-| HyperConverged status | HyperConverged CR reports Available or equivalent healthy state |
-| Worker scheduling | Virtualization pods run on workers, not on control plane nodes |
-| VM lifecycle test | A test VM can be created, started, and stopped successfully |
+| `oc get csv -A | grep -i kubevirt` | OpenShift Virtualization Operator installation succeeded |
+| `oc get hyperconverged -A` | HyperConverged custom resource reports healthy status |
+| `oc get pods -A -o wide | grep -E 'virt-|kubevirt'` | Virtualization pods run only on worker nodes |
+| `virtctl start <smoke-vm>` followed by `oc get vmi -A -o wide` | Smoke VM enters `Running` state on a worker node and stops cleanly when requested |
 
 **Exit Criteria**
 
@@ -529,14 +540,15 @@ Implement the DEV-local storage approach for VM disks using only the local SSD c
 - Capacity ledger per worker.
 - Storage limitation statement.
 
-**Validation Tests with Expected Results**
+**Validation Commands/Tests with Expected Results**
 
-| Validation Test | Expected Result |
+| Validation Command/Test | Expected Result |
 |---|---|
-| PVC provisioning | Test VM disk can be provisioned from the local storage class |
-| Node alignment | Test disk binds to the intended worker-local capacity |
-| Capacity review | Worker storage usage aligns to the approved placement plan |
-| Limitation review | Live migration limitation is documented and acknowledged |
+| `oc get storageclass` | Approved worker-local storage classes are present |
+| `oc get pv,pvc -A | grep <local-storage-class>` | Test PV and PVC objects are created successfully |
+| `oc describe pvc <test-pvc>` | PVC binds to the intended local storage on the expected worker |
+| Capacity review using `oc get pv -A` and the worker allocation ledger | Per-worker allocated disk aligns to the approved placement plan and accepted exception record |
+| Storage limitation acknowledgment review | Live-migration limitation for local-only DEV storage is documented and accepted |
 
 **Exit Criteria**
 
@@ -583,14 +595,15 @@ Provision the fixed set of application VMs on the designated worker nodes with t
 - Placement policy evidence.
 - Base operating system build records.
 
-**Validation Tests with Expected Results**
+**Validation Commands/Tests with Expected Results**
 
-| Validation Test | Expected Result |
+| Validation Command/Test | Expected Result |
 |---|---|
-| VM sizing review | Every VM matches the fixed CPU, RAM, and disk specification |
-| Placement review | Each VM is pinned to the intended worker node only |
-| Boot validation | All provisioned VMs boot successfully |
-| Capacity validation | Worker-3 provisioning proceeds only if the approved client decision covers the CPU and disk gap |
+| `oc get vm,vmi -A -o wide` | All fixed-scope VMs are present and running VMs show the intended worker placement |
+| `oc get vmi -A -o custom-columns=VM:.metadata.name,NODE:.status.nodeName` | Each VM runs only on its designated worker node |
+| Guest console or `ssh` login test to each VM | Each VM boots successfully and guest OS access works |
+| `oc describe vm <vm-name>` placement-control review | Node affinity or equivalent placement control is present for each VM |
+| Capacity validation against the fixed placement table and approved exception log | Worker-3 provisioning proceeds only under the approved client decision covering CPU and disk gaps |
 
 **Exit Criteria**
 
@@ -634,17 +647,17 @@ Install and configure the required application stack components inside the provi
 - Secrets integration evidence.
 - Service configuration baseline.
 
-**Validation Tests with Expected Results**
+**Validation Commands/Tests with Expected Results**
 
-| Validation Test | Expected Result |
+| Validation Command/Test | Expected Result |
 |---|---|
-| CI/CD smoke test | Jenkins can run a test pipeline using approved tools |
-| Secrets retrieval test | CI/CD stack retrieves secrets from VM12 successfully |
-| SQL connectivity test | Approved client login and sample database connectivity succeed |
-| ActiveMQ test | Queue creation and message send or receive test succeed |
-| API gateway test | NGINX routes a test request with the expected policy behavior |
-| Kafka and cache test | Produce and consume test succeeds and cache health endpoint responds |
-| Observability test | Logs and metrics are visible in ELK and Grafana |
+| `systemctl status` checks for Jenkins, Nexus, and SonarQube on VM3 | Core CI/CD services are active |
+| CI/CD smoke pipeline run | Jenkins executes a pipeline using the approved toolchain successfully |
+| Secrets retrieval test from Jenkins to VM12 using the approved plugin or API | CI/CD stack retrieves secrets successfully without cleartext credential storage |
+| `sqlcmd -S <sql-host> -Q "SELECT @@VERSION"` | SQL Server 2022 responds successfully |
+| Queue or topic smoke test for ActiveMQ and Kafka | Test message send and receive operations succeed |
+| `curl -sk https://<nginx-host>/health` | API gateway returns the expected healthy response |
+| `curl -s http://<elasticsearch-host>:9200/_cluster/health` and `curl -sk https://<grafana-host>/api/health` | ELK and Grafana endpoints respond with healthy status acceptable for DEV |
 
 **Exit Criteria**
 
@@ -684,15 +697,16 @@ Validate the integrated DEV platform, complete handover artifacts, and obtain cl
 - Handover pack.
 - Signed acceptance record or exception log.
 
-**Validation Tests with Expected Results**
+**Validation Commands/Tests with Expected Results**
 
-| Validation Test | Expected Result |
+| Validation Command/Test | Expected Result |
 |---|---|
-| Cluster health check | Nodes and critical operators remain healthy |
-| VM placement check | VMs remain on the approved worker nodes |
-| End-to-end service flow | Test transactions pass across the required platform components |
-| Audit and monitoring check | Logs, alerts, and access events are visible as designed |
-| Handover review | Client confirms receipt of required artifacts and support contacts |
+| `oc get nodes,co` | Cluster nodes and critical operators remain healthy |
+| `oc get vmi -A -o custom-columns=VM:.metadata.name,NODE:.status.nodeName` | VMs remain on the approved worker nodes |
+| End-to-end delivery smoke run through CI/CD, secrets, messaging, database, gateway, and observability paths | Test transactions succeed across the required platform components |
+| Audit-log, SIEM, and monitoring review | Logs, alerts, and access events are visible as designed |
+| Backup, export, or rebuild drill for the approved DEV recovery method | The selected DEV recovery method completes successfully |
+| Formal handover checklist walkthrough | Client confirms receipt of required artifacts, support contacts, and accepted limitations |
 
 **Exit Criteria**
 
@@ -804,11 +818,7 @@ Validate the integrated DEV platform, complete handover artifacts, and obtain cl
 
 ### 7.2 Assumptions
 
-- The client will provide a supported and approved method to realize the six-node OpenShift topology on the three physical servers.
-- The client will provide all required network, identity, firewall, certificate, and content-source dependencies before execution reaches the relevant phase.
-- DEV acceptance criteria allow local-only VM storage and do not require shared-storage live migration.
-- Control plane nodes remain unschedulable throughout the environment lifecycle.
-- Required licenses, binaries, install media, and product subscriptions for the application stack are provided by the client.
+No unresolved planning assumptions are retained in this plan. Items that require client confirmation or approval have been moved to **Decisions Required from Client**.
 
 ### 7.3 Decisions Required from Client
 
@@ -816,7 +826,13 @@ Validate the integrated DEV platform, complete handover artifacts, and obtain cl
 - Confirm the supported method used to instantiate one control plane node and one worker node per physical server.
 - Approve the disposition for the Worker-3 CPU and disk shortfall against the fixed placement and fixed worker size.
 - Confirm the on-prem API VIP and Ingress VIP delivery method.
+- Confirm proxy, `noProxy`, and outbound allow-list requirements for the bastion host, cluster, Operators, guest OS patching, and tool installation paths.
 - Confirm whether the environment is connected to Red Hat registries or requires a client-provided mirror.
+- Confirm that all required network, identity, firewall, certificate, logging, monitoring, and content-source dependencies will be delivered before the relevant phase gates.
+- Confirm that DEV acceptance criteria allow local-only VM storage without RWX-backed live migration.
+- Confirm the approved security-hardening baseline, vulnerability-management process, EDR or anti-malware requirements, and SIEM onboarding expectations for the environment.
+- Confirm the approved privileged-access model, including MFA, PAM, session recording, and break-glass workflow.
+- Confirm that the client will provide the required licenses, binaries, install media, templates, and subscriptions for the application stack before Phase 7 and Phase 8.
 - Select HashiCorp Vault or CyberArk for VM12.
 - Define the cache technology paired with Kafka on VM7.
 - Define the intended ELK and Grafana operating pattern across VM8 and VM9 for DEV.
